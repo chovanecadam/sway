@@ -115,6 +115,12 @@ struct sway_server {
 	struct wlr_ext_foreign_toplevel_image_capture_source_manager_v1 *ext_foreign_toplevel_image_capture_source_manager_v1;
 	struct wl_listener new_foreign_toplevel_capture_request;
 
+	// Restricted socket support
+	char *socket_restricted;
+	int restricted_socket_lock_fd;
+	struct wl_event_source *restricted_socket_source;
+	struct wl_list restricted_clients; // restricted_client_node::link
+
 	struct wlr_xdg_activation_v1 *xdg_activation_v1;
 	struct wl_listener xdg_activation_v1_request_activate;
 	struct wl_listener xdg_activation_v1_new_token;

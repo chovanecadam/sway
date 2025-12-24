@@ -1,7 +1,12 @@
 #include <assert.h>
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
 #include <wayland-server-core.h>
 #include <wlr/backend.h>
 #include <wlr/backend/headless.h>
@@ -80,6 +85,12 @@
 
 bool allow_unsupported_gpu = false;
 
+struct restricted_client_node {
+	struct wl_client *client;
+	struct wl_list link;
+	struct wl_listener destroy;
+};
+
 #if WLR_HAS_DRM_BACKEND
 static void handle_drm_lease_request(struct wl_listener *listener, void *data) {
 	/* We only offer non-desktop outputs, but in the future we might want to do
@@ -128,6 +139,119 @@ static bool is_privileged(const struct wl_global *global) {
 		global == server.xdg_output_manager_v1->global;
 }
 
+static int create_restricted_socket(const char *name, int *out_lock_fd) {
+	const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+	if (!runtime_dir) {
+		sway_log(SWAY_ERROR, "XDG_RUNTIME_DIR not set");
+		return -1;
+	}
+
+	// Create lock file path
+	char lock_path[256];
+	snprintf(lock_path, sizeof(lock_path), "%s/%s.lock", runtime_dir, name);
+
+	// Create and lock the lock file
+	int lock_fd = open(lock_path, O_CREAT | O_CLOEXEC | O_RDWR, 0600);
+	if (lock_fd < 0) {
+		sway_log_errno(SWAY_ERROR, "Failed to create lock file %s", lock_path);
+		return -1;
+	}
+
+	if (flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
+		sway_log_errno(SWAY_ERROR, "Failed to lock %s (another compositor running?)", lock_path);
+		close(lock_fd);
+		return -1;
+	}
+
+	int sock_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (sock_fd < 0) {
+		sway_log_errno(SWAY_ERROR, "Failed to create socket");
+		close(lock_fd);
+		unlink(lock_path);
+		return -1;
+	}
+
+	struct sockaddr_un addr = {
+		.sun_family = AF_UNIX,
+	};
+	snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/%s", runtime_dir, name);
+
+	// Remove stale socket if exists
+	unlink(addr.sun_path);
+
+	if (bind(sock_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		sway_log_errno(SWAY_ERROR, "Failed to bind socket %s", addr.sun_path);
+		close(sock_fd);
+		close(lock_fd);
+		unlink(lock_path);
+		return -1;
+	}
+
+	if (listen(sock_fd, 128) < 0) {
+		sway_log_errno(SWAY_ERROR, "Failed to listen on socket");
+		close(sock_fd);
+		unlink(addr.sun_path);
+		close(lock_fd);
+		unlink(lock_path);
+		return -1;
+	}
+
+	*out_lock_fd = lock_fd;
+	return sock_fd;
+}
+
+static void handle_restricted_client_destroy(struct wl_listener *listener, void *data) {
+	struct restricted_client_node *node =
+		wl_container_of(listener, node, destroy);
+	wl_list_remove(&node->link);
+	wl_list_remove(&node->destroy.link);
+	free(node);
+}
+
+static int handle_restricted_socket_connection(int fd, uint32_t mask, void *data) {
+	struct sway_server *server = data;
+
+	// Accept the connection
+	int client_fd = accept(fd, NULL, NULL);
+	if (client_fd < 0) {
+		sway_log_errno(SWAY_ERROR, "Failed to accept restricted client");
+		return 1;
+	}
+
+	// Create wl_client (same pattern as swaybar/swaybg)
+	struct wl_client *client = wl_client_create(server->wl_display, client_fd);
+	if (!client) {
+		sway_log_errno(SWAY_ERROR, "wl_client_create failed for restricted client");
+		close(client_fd);
+		return 1;
+	}
+
+	// Mark as restricted
+	struct restricted_client_node *node = calloc(1, sizeof(*node));
+	if (!node) {
+		sway_log(SWAY_ERROR, "Failed to allocate restricted client node");
+		return 1;
+	}
+
+	node->client = client;
+	node->destroy.notify = handle_restricted_client_destroy;
+	wl_client_add_destroy_listener(client, &node->destroy);
+	wl_list_insert(&server->restricted_clients, &node->link);
+
+	sway_log(SWAY_DEBUG, "Accepted restricted client");
+	return 1;
+}
+
+static bool is_restricted_client(const struct wl_client *client) {
+	struct restricted_client_node *node;
+	wl_list_for_each(node, &server.restricted_clients, link) {
+		if (node->client == client) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static bool filter_global(const struct wl_client *client,
 		const struct wl_global *global, void *data) {
 #if WLR_HAS_XWAYLAND
@@ -138,12 +262,14 @@ static bool filter_global(const struct wl_client *client,
 #endif
 
 	// Restrict usage of privileged protocols to unsandboxed clients
+	// and clients not connected through the restricted socket
 	// TODO: add a way for users to configure an allow-list
 	const struct wlr_security_context_v1_state *security_context =
 		wlr_security_context_manager_v1_lookup_client(
 		server.security_context_manager_v1, (struct wl_client *)client);
+	bool client_is_restricted = is_restricted_client(client);
 	if (is_privileged(global)) {
-		return security_context == NULL;
+		return security_context == NULL && !client_is_restricted;
 	}
 
 	return true;
@@ -260,6 +386,11 @@ bool server_init(struct sway_server *server) {
 	wl_display_set_default_max_buffer_size(server->wl_display, 1024 * 1024);
 
 	wlr_fixes_create(server->wl_display, 1);
+
+	// Initialize restricted socket support
+	wl_list_init(&server->restricted_clients);
+	server->restricted_socket_lock_fd = -1;
+
 	root = root_create(server->wl_display);
 
 	server->backend = wlr_backend_autocreate(server->wl_event_loop, &server->session);
@@ -504,6 +635,28 @@ bool server_init(struct sway_server *server) {
 		return false;
 	}
 
+	// Create restricted socket
+	char restricted_name[32];
+	snprintf(restricted_name, sizeof(restricted_name), "%s-restricted", server->socket);
+	int lock_fd = -1;
+	int sock_fd = create_restricted_socket(restricted_name, &lock_fd);
+	if (sock_fd >= 0) {
+		server->socket_restricted = strdup(restricted_name);
+		server->restricted_socket_lock_fd = lock_fd;
+		server->restricted_socket_source = wl_event_loop_add_fd(
+			server->wl_event_loop,
+			sock_fd,
+			WL_EVENT_READABLE,
+			handle_restricted_socket_connection,
+			server
+		);
+		sway_log(SWAY_INFO, "Created restricted socket: %s", restricted_name);
+	} else {
+		sway_log(SWAY_ERROR, "Unable to create restricted socket");
+		// Continue anyway - this is not fatal
+		server->restricted_socket_lock_fd = -1;
+	}
+
 	server->headless_backend = wlr_headless_backend_create(server->wl_event_loop);
 	if (!server->headless_backend) {
 		sway_log(SWAY_ERROR, "Failed to create secondary headless backend");
@@ -564,6 +717,30 @@ void server_fini(struct sway_server *server) {
 		wlr_xwayland_destroy(server->xwayland.wlr_xwayland);
 	}
 #endif
+	// Clean up restricted client list
+	struct restricted_client_node *node, *tmp;
+	wl_list_for_each_safe(node, tmp, &server->restricted_clients, link) {
+		wl_list_remove(&node->link);
+		wl_list_remove(&node->destroy.link);
+		free(node);
+	}
+	if (server->restricted_socket_source) {
+		wl_event_source_remove(server->restricted_socket_source);
+	}
+	// Close and clean up lock file
+	if (server->restricted_socket_lock_fd >= 0) {
+		close(server->restricted_socket_lock_fd);
+		if (server->socket_restricted) {
+			const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+			if (runtime_dir) {
+				char lock_path[256];
+				snprintf(lock_path, sizeof(lock_path), "%s/%s.lock",
+					runtime_dir, server->socket_restricted);
+				unlink(lock_path);
+			}
+		}
+	}
+	free(server->socket_restricted);
 	wl_display_destroy_clients(server->wl_display);
 	wlr_backend_destroy(server->backend);
 	wl_display_destroy(server->wl_display);
